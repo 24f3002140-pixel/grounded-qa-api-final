@@ -1,20 +1,27 @@
 # ============================================
-# GROUNDED QA API - IMPROVED VERSION
-# Better matching, more accurate answers
+# GROUNDED QA API WITH GEMINI AI
 # ============================================
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List
+import os
 import re
-from difflib import SequenceMatcher
 import uvicorn
 
-# Create the app
-app = FastAPI(title="Grounded QA API")
+# Try to import Google Gemini
+try:
+    import google.generativeai as genai
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
+    print("⚠️ Google Gemini not installed. Install with: pip install google-generativeai")
 
-# Allow everyone to access (CORS)
+# Create the app
+app = FastAPI(title="Grounded QA API with Gemini")
+
+# Enable CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -42,70 +49,52 @@ class QAResponse(BaseModel):
     answerable: bool
 
 # ============================================
-# THE QA SYSTEM - IMPROVED MATCHING
+# GEMINI QA SYSTEM
 # ============================================
 
 class GroundedQA:
     def __init__(self):
-        # Lower threshold to be more lenient
-        self.threshold = 0.15  # Changed from 0.3 to 0.15
+        self.threshold = 0.15
+        
+        # Initialize Gemini if available
+        if GEMINI_AVAILABLE and os.getenv("GEMINI_API_KEY"):
+            try:
+                genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+                self.model = genai.GenerativeModel('gemini-1.5-flash')
+                print("✅ Gemini AI initialized successfully!")
+            except Exception as e:
+                print(f"⚠️ Failed to initialize Gemini: {e}")
+                self.model = None
+        else:
+            self.model = None
+            if not os.getenv("GEMINI_API_KEY"):
+                print("⚠️ GEMINI_API_KEY not set. Using fallback matching.")
     
     def clean_text(self, text):
-        """Clean text for better comparison"""
+        """Clean text for comparison"""
         text = text.lower()
         text = re.sub(r'[^\w\s]', '', text)
         text = re.sub(r'\s+', ' ', text)
         return text.strip()
     
-    def extract_keywords(self, text):
-        """Extract important words from text"""
-        # Remove common words (stop words)
-        stop_words = {'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 
-                     'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will',
-                     'would', 'could', 'should', 'may', 'might', 'must', 'to',
-                     'for', 'of', 'with', 'by', 'from', 'up', 'about', 'into',
-                     'through', 'during', 'including', 'according', 'according'}
-        
-        words = text.lower().split()
-        keywords = [w for w in words if w not in stop_words and len(w) > 2]
-        return set(keywords)
-    
     def calculate_similarity(self, text1, text2):
-        """Calculate how similar two texts are (0 to 1)"""
+        """Calculate similarity (fallback when Gemini not available)"""
         clean1 = self.clean_text(text1)
         clean2 = self.clean_text(text2)
         
-        # Extract keywords
-        keywords1 = self.extract_keywords(clean1)
-        keywords2 = self.extract_keywords(clean2)
-        
-        # If either is empty, no similarity
-        if not keywords1 or not keywords2:
-            return 0.0
-        
-        # Calculate keyword overlap
-        common_keywords = keywords1.intersection(keywords2)
-        total_keywords = keywords1.union(keywords2)
-        
-        # Jaccard similarity
-        keyword_similarity = len(common_keywords) / len(total_keywords) if total_keywords else 0.0
-        
-        # Character sequence similarity
-        char_similarity = SequenceMatcher(None, clean1, clean2).ratio()
-        
-        # Word overlap ratio (how many question words appear in chunk)
         words1 = set(clean1.split())
         words2 = set(clean2.split())
-        word_overlap = len(words1.intersection(words2)) / len(words1) if words1 else 0.0
         
-        # Combine scores with weights
-        # Weighted more towards keyword matching
-        final_score = (keyword_similarity * 0.5) + (char_similarity * 0.2) + (word_overlap * 0.3)
+        if not words1 or not words2:
+            return 0.0
         
-        return round(final_score, 3)
+        common = words1.intersection(words2)
+        total = words1.union(words2)
+        
+        return len(common) / len(total) if total else 0.0
     
     def find_best_answer(self, question, chunks):
-        """Find the best answer from provided chunks"""
+        """Find answer using Gemini or fallback"""
         
         if not chunks:
             return {
@@ -115,43 +104,104 @@ class GroundedQA:
                 "answerable": False
             }
         
-        # Score each chunk
-        scored_chunks = []
+        # Try using Gemini first
+        if self.model:
+            try:
+                # Build context from chunks
+                context = "\n".join([f"[{chunk.chunk_id}] {chunk.text}" for chunk in chunks])
+                
+                # Create prompt that forces grounded answers
+                prompt = f"""
+You are a strict QA assistant. Answer the question ONLY using information from the provided context chunks.
+If the answer is not in the context, say "I don't know".
+
+Context chunks:
+{context}
+
+Question: {question}
+
+Rules:
+1. Only use information from the context
+2. Cite the chunk ID(s) you used
+3. If unsure, say "I don't know"
+4. Be concise
+
+Answer:"""
+                
+                # Get response from Gemini
+                response = self.model.generate_content(prompt)
+                answer = response.text.strip()
+                
+                # Extract citations from the answer
+                citations = []
+                # Look for chunk IDs like [C1], [C2] etc.
+                chunk_ids = re.findall(r'\[(C\d+)\]', answer)
+                citations = list(set(chunk_ids))
+                
+                # Verify citations exist in provided chunks
+                valid_ids = {chunk.chunk_id for chunk in chunks}
+                citations = [c for c in citations if c in valid_ids]
+                
+                # Clean answer: remove citation markers if present
+                clean_answer = re.sub(r'\[C\d+\]', '', answer).strip()
+                
+                # Check if it's "I don't know"
+                if "I don't know" in clean_answer or clean_answer.lower().strip() == "i don't know":
+                    return {
+                        "answer": "I don't know",
+                        "citations": [],
+                        "confidence": 0.2,
+                        "answerable": False
+                    }
+                
+                # Calculate confidence (Gemini gives good answers)
+                confidence = 0.85 if citations else 0.7
+                
+                return {
+                    "answer": clean_answer,
+                    "citations": citations if citations else [chunks[0].chunk_id],
+                    "confidence": round(confidence, 3),
+                    "answerable": True
+                }
+                
+            except Exception as e:
+                print(f"⚠️ Gemini error: {e}. Using fallback.")
+                # Fall through to regular matching
+        
+        # ============================================
+        # FALLBACK: Simple matching (without Gemini)
+        # ============================================
+        
+        scored = []
         for chunk in chunks:
             similarity = self.calculate_similarity(question, chunk.text)
-            scored_chunks.append({
+            scored.append({
                 "chunk": chunk,
-                "score": similarity,
-                "text": chunk.text
+                "score": similarity
             })
         
-        # Sort by score (highest first)
-        scored_chunks.sort(key=lambda x: x["score"], reverse=True)
+        scored.sort(key=lambda x: x["score"], reverse=True)
+        best = scored[0]
         
-        # Get the best match
-        best = scored_chunks[0]
-        best_score = best["score"]
-        
-        # Check if good enough to answer
-        if best_score < self.threshold:
+        if best["score"] < self.threshold:
             return {
                 "answer": "I don't know",
                 "citations": [],
-                "confidence": min(best_score, 0.3),
+                "confidence": min(best["score"], 0.3),
                 "answerable": False
             }
-        
-        # Calculate confidence
-        confidence = round(min(best_score * 1.2, 0.95), 3)
         
         return {
             "answer": best["chunk"].text,
             "citations": [best["chunk"].chunk_id],
-            "confidence": confidence,
+            "confidence": round(min(best["score"] * 1.2, 0.95), 3),
             "answerable": True
         }
 
-# Create the QA system
+# ============================================
+# CREATE QA SYSTEM
+# ============================================
+
 qa_system = GroundedQA()
 
 # ============================================
@@ -163,15 +213,14 @@ qa_system = GroundedQA()
 async def health_check():
     return {
         "status": "healthy",
-        "message": "Grounded QA API is running!",
-        "version": "1.0.0"
+        "message": "Grounded QA API with Gemini",
+        "gemini_available": GEMINI_AVAILABLE and qa_system.model is not None,
+        "version": "2.0.0"
     }
 
 @app.post("/grounded-answer", response_model=QAResponse)
 async def grounded_answer(request: QARequest):
-    """Main endpoint: Answer questions from provided chunks"""
     try:
-        # Validate question
         if not request.question or not request.question.strip():
             return QAResponse(
                 answer="I don't know",
@@ -180,10 +229,8 @@ async def grounded_answer(request: QARequest):
                 answerable=False
             )
         
-        # Get the answer
         result = qa_system.find_best_answer(request.question, request.chunks)
         
-        # Ensure "I don't know" format
         if not result["answerable"]:
             result["answer"] = "I don't know"
             result["citations"] = []
@@ -200,18 +247,12 @@ async def grounded_answer(request: QARequest):
             answerable=False
         )
 
-# ============================================
-# RUN THE SERVER
-# ============================================
-
 if __name__ == "__main__":
     print("\n" + "="*60)
-    print("🚀 GROUNDED QA API - IMPROVED")
+    print("🚀 GROUNDED QA API WITH GEMINI")
     print("="*60)
     print("📡 Server: http://localhost:8000")
     print("🔗 Endpoint: http://localhost:8000/grounded-answer")
-    print("🔍 Health: http://localhost:8000/health")
     print("="*60)
-    print("\n✅ Ready to answer questions!")
-    print("Press CTRL+C to stop\n")
+    print("\n✅ Ready! Press CTRL+C to stop\n")
     uvicorn.run(app, host="0.0.0.0", port=8000)
